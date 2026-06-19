@@ -418,6 +418,13 @@ def main() -> int:
                 "可设置 --kronos-path 或 export KRONOS_PATH=/path/to/Kronos-Tokenizer-base"
             )
 
+    max_spi = _resolve_sample_cap(args)
+    if not args.full and args.max_instruments is None:
+        logger.warning(
+            "未指定 --max-instruments 且非 --full：将从 manifest 加载全部标的。"
+            "建议加上 --max-instruments 200"
+        )
+
     num_workers = args.num_workers
     if args.gpu_cache_data or (args.batched_gpu and not args.batched_gpu_cpu):
         if num_workers > 0:
@@ -434,8 +441,8 @@ def main() -> int:
     )
 
     logger.info(
-        "BPC-v4: instruments=%d window=%s..%s qlib=%s output=%s",
-        len(instruments), start, end, config.qlib.provider_uri, out_dir,
+        "BPC-v4: instruments=%d window=%s..%s max_spi=%s qlib=%s output=%s",
+        len(instruments), start, end, max_spi, config.qlib.provider_uri, out_dir,
     )
 
     run_training(
@@ -445,7 +452,7 @@ def main() -> int:
         preprocessed_dir=Path(args.preprocessed_dir) if args.preprocessed_dir else None,
         save_preprocessed=Path(args.save_preprocessed) if args.save_preprocessed else None,
         force_rebuild_preprocessed=args.force_rebuild_preprocessed,
-        max_samples_per_instrument=_resolve_sample_cap(args),
+        max_samples_per_instrument=max_spi,
         val_every=args.val_every,
         save_every=args.save_every,
         val_max_batches=args.val_max_batches,

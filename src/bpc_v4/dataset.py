@@ -1,4 +1,4 @@
-"""bpc_v4 Qlib 数据集：单次物化 + 预处理缓存 + DataLoader 策略。"""
+"""bpc_v4 Qlib 数据集：逐标的加载 + 日历切分 + 预处理缓存 + DataLoader 策略。"""
 
 from __future__ import annotations
 
@@ -6,9 +6,10 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset
 
@@ -18,6 +19,8 @@ try:
     QLIB_AVAILABLE = True
 except ImportError:
     QLIB_AVAILABLE = False
+
+from quant_cursor.bpc.dataset import TemporalSplit, ensure_qlib, load_trading_calendar
 
 from .config import GlobalConfig
 from .features import compute_bpc_features, compute_context_features, compute_time_embedding
@@ -33,6 +36,98 @@ from .materialize import (
 )
 
 logger = logging.getLogger(__name__)
+
+OHLCVA_FIELDS = ["$open", "$high", "$low", "$close", "$volume", "$amount"]
+
+
+@dataclass
+class _V4InstrumentSeries:
+    qlib_id: str
+    dates: pd.DatetimeIndex
+    ohlcva: np.ndarray
+
+
+class BPCV4InstrumentStore:
+    """按标的逐个从 qlib 加载 OHLCVA，仅拉取 config 指定日期窗口。"""
+
+    def __init__(
+        self,
+        instruments: List[str],
+        start: str,
+        end: str,
+        provider_uri: Path,
+        *,
+        calendar: pd.DatetimeIndex | None = None,
+        pad_missing_amount: bool = True,
+    ):
+        if not QLIB_AVAILABLE:
+            raise RuntimeError("qlib 未安装")
+
+        ensure_qlib(provider_uri)
+        self.provider_uri = Path(provider_uri)
+        self.start = start
+        self.end = end
+        self.calendar = calendar if calendar is not None else load_trading_calendar(self.provider_uri)
+        self.pad_missing_amount = pad_missing_amount
+
+        self._cache: Dict[str, _V4InstrumentSeries] = {}
+        total = len(instruments)
+        for i, qlib_id in enumerate(instruments, 1):
+            series = self._load_one(qlib_id)
+            if series is not None:
+                self._cache[qlib_id] = series
+            if i % 50 == 0 or i == total:
+                logger.info(
+                    "BPC-v4 InstrumentStore: loaded %d/%d (cached=%d)",
+                    i,
+                    total,
+                    len(self._cache),
+                )
+
+        if not self._cache:
+            raise RuntimeError("BPC-v4 InstrumentStore: 无有效标的")
+
+        self.symbol_to_id: Dict[str, int] = {qlib_id: i for i, qlib_id in enumerate(self._cache.keys())}
+        logger.info(
+            "BPC-v4 InstrumentStore ready: %d instruments, window=%s..%s",
+            len(self._cache),
+            start,
+            end,
+        )
+
+    def _load_one(self, qlib_id: str) -> Optional[_V4InstrumentSeries]:
+        try:
+            panel = D.features([qlib_id], OHLCVA_FIELDS, start_time=self.start, end_time=self.end, freq="day")
+        except Exception as exc:
+            logger.warning("跳过 %s: %s", qlib_id, exc)
+            return None
+
+        if panel is None or panel.empty:
+            return None
+        if "instrument" in panel.index.names:
+            panel = panel.droplevel("instrument")
+        panel = panel.sort_index()
+
+        for col in OHLCVA_FIELDS:
+            if col not in panel.columns:
+                if col == "$amount" and self.pad_missing_amount:
+                    panel[col] = 0.0
+                else:
+                    logger.warning("跳过 %s: 缺少字段 %s", qlib_id, col)
+                    return None
+
+        values = panel[OHLCVA_FIELDS].apply(pd.to_numeric, errors="coerce")
+        close = values["$close"]
+        valid = close.notna() & close.gt(0)
+        values = values[valid]
+        if len(values) <= 0:
+            return None
+
+        return _V4InstrumentSeries(
+            qlib_id=qlib_id,
+            dates=values.index,
+            ohlcva=values.to_numpy(dtype=np.float32),
+        )
 
 
 @dataclass
@@ -67,79 +162,62 @@ def resolve_qlib_instruments(
     return codes
 
 
-def _resolve_feature_codes(instruments: List[str]):
-    if len(instruments) == 1 and "." not in instruments[0]:
-        return D.instruments(instruments[0])
-    return instruments
-
-
-def _load_qlib_series(config: GlobalConfig) -> Tuple[Dict[str, np.ndarray], List[str]]:
-    if not QLIB_AVAILABLE:
-        raise RuntimeError("qlib 未安装")
-
-    qlib.init(provider_uri=str(config.qlib.provider_uri.expanduser()), region="cn")
-    codes = _resolve_feature_codes(config.qlib.instruments)
-    fields = ["$open", "$high", "$low", "$close", "$volume", "$amount"]
-    df = D.features(codes, fields, start_time=config.qlib.start_date, end_time=config.qlib.end_date, freq="day")
-
-    symbols = df.index.get_level_values(1).unique().tolist()
-    series: Dict[str, np.ndarray] = {}
-    for sym in symbols:
-        sym_df = df.xs(sym, level=1)
-        series[sym] = sym_df[fields].values.astype(np.float32)
-
-    logger.info("Loaded %d symbols from qlib", len(symbols))
-    return series, symbols
-
-
-def _build_sample_list(
-    series: Dict[str, np.ndarray],
+def _collect_valid_indices(
+    series: _V4InstrumentSeries,
+    split: TemporalSplit,
+    mode: Literal["train", "val"],
     seq_len: int,
-    max_samples_per_instrument: Optional[int] = None,
-) -> List[Tuple[str, int]]:
-    samples: List[Tuple[str, int]] = []
-    for sym, arr in series.items():
-        T = arr.shape[0]
-        sym_samples = [(sym, t) for t in range(seq_len, T)]
-        if max_samples_per_instrument is not None:
-            sym_samples = sym_samples[:max_samples_per_instrument]
-        samples.extend(sym_samples)
-    return samples
+) -> List[int]:
+    n = len(series.dates)
+    if n <= seq_len:
+        return []
 
-
-def _apply_split(
-    samples: List[Tuple[str, int]],
-    mode: str,
-    val_ratio: float,
-    test_ratio: float,
-    max_samples: Optional[int],
-) -> List[Tuple[str, int]]:
-    split_idx = int(len(samples) * (1 - val_ratio - test_ratio))
-    val_idx = int(len(samples) * (1 - test_ratio))
+    t_idx = np.arange(seq_len, n, dtype=np.int64)
+    anchors = series.dates[t_idx]
 
     if mode == "train":
-        out = samples[:split_idx]
-    elif mode == "val":
-        out = samples[split_idx:val_idx]
+        mask = anchors <= split.train_end
+        window_starts = series.dates[t_idx - seq_len]
+        mask &= window_starts >= split.data_start
+        mask &= window_starts <= split.train_end
     else:
-        out = samples[val_idx:]
+        mask = (anchors >= split.val_start) & (anchors <= split.val_end)
+        mask &= series.dates[t_idx - seq_len] >= split.data_start
 
-    if max_samples is not None and max_samples > 0:
-        if mode == "train":
-            cap = max(1, int(max_samples * 0.8))
-        elif mode == "val":
-            cap = max(1, max_samples - int(max_samples * 0.8))
-        else:
-            cap = max(1, max_samples // 10)
-        out = out[:cap]
-    return out
+    return t_idx[mask].tolist()
+
+
+def _build_split_samples(
+    store: BPCV4InstrumentStore,
+    split: TemporalSplit,
+    mode: Literal["train", "val"],
+    seq_len: int,
+    *,
+    max_samples_per_instrument: Optional[int] = None,
+    seed: int = 42,
+) -> List[Tuple[str, int]]:
+    samples: List[Tuple[str, int]] = []
+    rng = np.random.default_rng(seed)
+    n_inst = len(store._cache)
+
+    for j, (qlib_id, series) in enumerate(store._cache.items(), 1):
+        valid_ts = _collect_valid_indices(series, split, mode, seq_len)
+        if max_samples_per_instrument is not None and len(valid_ts) > max_samples_per_instrument:
+            picked = rng.choice(valid_ts, size=max_samples_per_instrument, replace=False).tolist()
+            valid_ts = sorted(picked)
+        samples.extend((qlib_id, t) for t in valid_ts)
+        if j % 50 == 0 or j == n_inst:
+            logger.info("[%s] indexed %d/%d instruments, samples=%d", mode, j, n_inst, len(samples))
+
+    if not samples:
+        raise RuntimeError(f"BPC-v4 {mode} 集未构建任何样本，请检查日期窗口或 max_samples_per_instrument")
+    return samples
 
 
 def materialize_samples(
     config: GlobalConfig,
     samples: List[Tuple[str, int]],
-    series: Dict[str, np.ndarray],
-    symbols: List[str],
+    store: BPCV4InstrumentStore,
     *,
     share_memory: bool = False,
 ) -> MaterializedBPCV4Dataset:
@@ -151,10 +229,12 @@ def materialize_samples(
     )
 
     z_q_list, bpc_list, ctx_list, time_list, stock_list, s1_list = [], [], [], [], [], []
+    n_total = len(samples)
 
     for i, (sym, t_idx) in enumerate(samples):
-        window = series[sym][t_idx - seq_len : t_idx]
-        prev_bar = series[sym][t_idx - seq_len - 1]
+        arr = store._cache[sym].ohlcva
+        window = arr[t_idx - seq_len : t_idx]
+        prev_bar = arr[t_idx - seq_len - 1]
 
         ohlcv = torch.from_numpy(window[:, :5]).float().unsqueeze(0)
         amount = torch.from_numpy(window[:, 5:6]).float().unsqueeze(0)
@@ -174,10 +254,10 @@ def materialize_samples(
                 raw_dim=config.embedding.time_raw_dim,
             ).squeeze(0).cpu()
         )
-        stock_list.append(symbols.index(sym) if sym in symbols else 0)
+        stock_list.append(store.symbol_to_id.get(sym, 0))
 
-        if (i + 1) % 5000 == 0:
-            logger.info("Materialized %d/%d samples", i + 1, len(samples))
+        if (i + 1) % 5000 == 0 or i + 1 == n_total:
+            logger.info("Materialized %d/%d samples", i + 1, n_total)
 
     ds = MaterializedBPCV4Dataset(
         z_q=torch.stack(z_q_list),
@@ -200,6 +280,7 @@ def build_datasets(
     preprocessed_dir: Optional[Path] = None,
     save_preprocessed: Optional[Path] = None,
     force_rebuild: bool = False,
+    seed: int = 42,
 ) -> Tuple[MaterializedBPCV4Dataset, MaterializedBPCV4Dataset, MaterializedBPCV4Dataset]:
     cache_root = preprocessed_dir or save_preprocessed
     if cache_root and not force_rebuild:
@@ -213,29 +294,67 @@ def build_datasets(
             test_ds = load_materialized_dataset(test_p) if test_p.exists() else val_ds
             return train_ds, val_ds, test_ds
 
-    series, symbols = _load_qlib_series(config)
-    all_samples = _build_sample_list(series, config.kronos.seq_len, max_samples_per_instrument)
+    provider_uri = config.qlib.provider_uri.expanduser()
+    calendar = load_trading_calendar(provider_uri)
+    holdout_ratio = config.qlib.val_ratio + config.qlib.test_ratio
+    split = TemporalSplit.from_calendar(
+        calendar,
+        holdout_ratio,
+        data_start=config.qlib.start_date,
+        data_end=config.qlib.end_date,
+    )
+    logger.info(
+        "Calendar window: %s .. %s (%d trading days) | train_end=%s | val=%s..%s | "
+        "instruments=%d | max_samples_per_instrument=%s",
+        split.data_start.date(),
+        split.data_end.date(),
+        len(calendar[(calendar >= split.data_start) & (calendar <= split.data_end)]),
+        split.train_end.date(),
+        split.val_start.date(),
+        split.val_end.date(),
+        len(config.qlib.instruments),
+        max_samples_per_instrument,
+    )
 
-    train_samples = _apply_split(all_samples, "train", config.qlib.val_ratio, config.qlib.test_ratio, config.qlib.max_samples)
-    val_samples = _apply_split(all_samples, "val", config.qlib.val_ratio, config.qlib.test_ratio, config.qlib.max_samples)
-    test_samples = _apply_split(all_samples, "test", config.qlib.val_ratio, config.qlib.test_ratio, config.qlib.max_samples)
+    store = BPCV4InstrumentStore(
+        instruments=list(config.qlib.instruments),
+        start=config.qlib.start_date,
+        end=config.qlib.end_date,
+        provider_uri=provider_uri,
+        calendar=calendar,
+        pad_missing_amount=config.kronos.amount_pad_zero,
+    )
+    seq_len = config.kronos.seq_len
+    train_samples = _build_split_samples(
+        store, split, "train", seq_len,
+        max_samples_per_instrument=max_samples_per_instrument,
+        seed=seed,
+    )
+    val_samples = _build_split_samples(
+        store, split, "val", seq_len,
+        max_samples_per_instrument=max_samples_per_instrument,
+        seed=seed + 1,
+    )
 
-    logger.info("Materializing train=%d val=%d test=%d samples", len(train_samples), len(val_samples), len(test_samples))
+    logger.info("Materializing train=%d val=%d samples (no separate test pass)", len(train_samples), len(val_samples))
 
-    train_ds = materialize_samples(config, train_samples, series, symbols, share_memory=share_memory)
-    val_ds = materialize_samples(config, val_samples, series, symbols, share_memory=share_memory)
-    test_ds = materialize_samples(config, test_samples, series, symbols, share_memory=share_memory)
+    train_ds = materialize_samples(config, train_samples, store, share_memory=share_memory)
+    val_ds = materialize_samples(config, val_samples, store, share_memory=share_memory)
+    test_ds = val_ds
 
     if save_preprocessed:
         save_preprocessed.mkdir(parents=True, exist_ok=True)
         save_materialized_dataset(train_ds, save_preprocessed / "train")
         save_materialized_dataset(val_ds, save_preprocessed / "val")
-        save_materialized_dataset(test_ds, save_preprocessed / "test")
         meta = {
             "schema_version": "bpc_v4",
             "start_date": config.qlib.start_date,
             "end_date": config.qlib.end_date,
-            "n_instruments": len(config.qlib.instruments),
+            "train_end": str(split.train_end.date()),
+            "val_start": str(split.val_start.date()),
+            "val_end": str(split.val_end.date()),
+            "n_instruments": len(store._cache),
+            "instrument_ids": list(store._cache.keys()),
             "max_samples": config.qlib.max_samples,
             "max_samples_per_instrument": max_samples_per_instrument,
             "train_samples": len(train_ds),
@@ -325,6 +444,7 @@ def create_dataloaders(
         preprocessed_dir=preprocessed_dir,
         save_preprocessed=save_preprocessed,
         force_rebuild=force_rebuild_preprocessed,
+        seed=opts.seed,
     )
 
     device = torch.device(config.train.device if torch.cuda.is_available() else "cpu")
