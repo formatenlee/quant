@@ -1,0 +1,5 @@
+# bpc_v4 额外依赖（与根 requirements.txt 隔离）
+torch>=2.1.0
+transformers>=4.40.0
+numpy>=1.24
+pyyaml>=6.0
