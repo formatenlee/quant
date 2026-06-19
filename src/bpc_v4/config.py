@@ -10,7 +10,7 @@ class KronosConfig:
     model_name: str = "NeoQuasar/Kronos-Tokenizer-base"
     revision: str = "main"
     seq_len: int = 40
-    d_model: int = 768
+    d_model: int = 20  # z_q = s1_bits + s2_bits；训练前由 sync_kronos_config 校验
     amount_pad_zero: bool = True
     local_path: str = ""  # 空则自动探测；见 kronos.resolve_kronos_local_path
 
@@ -42,7 +42,7 @@ class EmbeddingConfig:
 
 @dataclass
 class FusionConfig:
-    fused_dim: int = 768 + 26 + 7 + 32  # 833
+    fused_dim: int = 20 + 26 + 7 + 32  # kronos.d_model + bpc + ctx + emb
     hidden_dim: int = 256
     dropout: float = 0.2
 

@@ -1,5 +1,8 @@
-"""Kronos Tokenizer 单例封装（完全冻结，参考更优实现）"""
+"""Kronos Tokenizer 单例封装（完全冻结，仅加载 tokenizer 权重）"""
 
+from __future__ import annotations
+
+import json
 import logging
 import os
 from pathlib import Path
@@ -7,6 +10,8 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+
+from .kronos_model import KronosTokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -51,8 +56,28 @@ def resolve_kronos_local_path(explicit: Optional[str] = None) -> Optional[str]:
     return None
 
 
+def read_kronos_z_q_dim(local_path: Optional[str] = None) -> int:
+    """从 tokenizer config.json 读取 z_q 维度（s1_bits + s2_bits）。"""
+    path = local_path or resolve_kronos_local_path()
+    if not path:
+        return 20
+    cfg_path = Path(path) / "config.json"
+    if not cfg_path.exists():
+        return 20
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    return int(cfg.get("s1_bits", 10) + cfg.get("s2_bits", 10))
+
+
+def sync_kronos_config(config) -> None:
+    """将 GlobalConfig.kronos.d_model 对齐到 tokenizer 的 z_q 维度。"""
+    z_q_dim = read_kronos_z_q_dim(config.kronos.local_path or None)
+    if config.kronos.d_model != z_q_dim:
+        logger.info("Sync kronos.d_model: %d -> %d (z_q codebook dim)", config.kronos.d_model, z_q_dim)
+        config.kronos.d_model = z_q_dim
+
+
 class KronosTokenizerPool:
-    """全局单例，避免重复加载 102M 参数模型"""
+    """全局单例，避免重复加载 tokenizer 权重。"""
 
     _instance: Optional["KronosTokenizerPool"] = None
     _tokenizer: Optional[nn.Module] = None
@@ -69,47 +94,49 @@ class KronosTokenizerPool:
         local_path: Optional[str] = None,
         device: str = "cuda",
     ):
-        if hasattr(self, "_initialized"):
+        if getattr(self, "_initialized", False):
             return
         self._initialized = True
         self._model_name = model_name
-        self._local_path = local_path
+        self._local_path = local_path or resolve_kronos_local_path()
         self._device = torch.device(device if torch.cuda.is_available() else "cpu")
 
         self._load_tokenizer()
 
     def _load_tokenizer(self):
-        """加载预训练 Kronos Tokenizer 并冻结"""
-        try:
-            from transformers import AutoModel
-        except ImportError:
-            raise ImportError("请安装 transformers: pip install transformers")
+        """加载预训练 KronosTokenizer 并冻结。"""
+        local_files_only = False
+        load_path = self._local_path
 
-        if self._local_path and Path(self._local_path).exists():
-            logger.info("正在从本地路径加载 Kronos Tokenizer: %s", self._local_path)
-            self._tokenizer = AutoModel.from_pretrained(self._local_path, local_files_only=True)
+        if load_path and Path(load_path).is_dir():
+            logger.info("正在从本地路径加载 Kronos Tokenizer: %s", load_path)
+            local_files_only = True
         else:
-            resolved = resolve_kronos_local_path(self._local_path)
-            if resolved:
-                self._local_path = resolved
-                logger.info("正在从本地路径加载 Kronos Tokenizer: %s", resolved)
-                self._tokenizer = AutoModel.from_pretrained(resolved, local_files_only=True)
-            else:
-                logger.info("正在从 HuggingFace 加载 Kronos Tokenizer: %s", self._model_name)
-                self._tokenizer = AutoModel.from_pretrained(self._model_name)
+            load_path = self._model_name
+            logger.info("正在从 HuggingFace 加载 Kronos Tokenizer: %s", load_path)
 
+        self._tokenizer = KronosTokenizer.from_pretrained(
+            load_path,
+            local_files_only=local_files_only,
+        )
         self._tokenizer.eval()
         self._tokenizer.to(self._device)
 
         for param in self._tokenizer.parameters():
             param.requires_grad = False
 
-        self._d_model = getattr(self._tokenizer.config, "hidden_size", 768)
-        logger.info(f"Kronos loaded: d_model={self._d_model}, device={self._device}")
+        self._z_q_dim = self._tokenizer.codebook_dim
+        logger.info(
+            "Kronos tokenizer loaded: z_q_dim=%d, d_model=%d, device=%s",
+            self._z_q_dim,
+            self._tokenizer.d_model,
+            self._device,
+        )
 
     @property
     def d_model(self) -> int:
-        return self._d_model
+        """BPC 融合使用的 z_q 维度（codebook bits，非 transformer hidden size）。"""
+        return self._z_q_dim
 
     @property
     def device(self) -> torch.device:
@@ -119,12 +146,13 @@ class KronosTokenizerPool:
     def encode(self, ohlcva: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         输入: ohlcva [B, T, 6]
-        返回: (z_q [B, T, d_model], s1_ids [B, T], s2_ids [B, T])
+        返回: (z_q [B, T, codebook_dim], s1_ids [B, T], s2_ids [B, T])
         """
         if self._tokenizer is None:
             raise RuntimeError("Tokenizer not loaded")
 
         ohlcva = ohlcva.to(self._device)
-        (_, _), _, z_q, _ = self._tokenizer(ohlcva)
-        s1_ids, s2_ids = self._tokenizer.encode(ohlcva, half=True)
+        _, _, z_q, _ = self._tokenizer(ohlcva)
+        z_indices = self._tokenizer.encode(ohlcva, half=True)
+        s1_ids, s2_ids = z_indices[0], z_indices[1]
         return z_q, s1_ids, s2_ids

@@ -36,6 +36,7 @@ from .dataset import (
     to_device,
     _loader_has_gpu_batches,
 )
+from .kronos import sync_kronos_config
 from .model import BPCV4Model
 
 logger = logging.getLogger("quant_cursor.bpc_v4.train")
@@ -152,6 +153,8 @@ def run_training(
     device = torch.device(config.train.device if torch.cuda.is_available() else "cpu")
     use_cuda = device.type == "cuda"
     logger.info("Using device: %s", device)
+
+    sync_kronos_config(config)
 
     train_loader, val_loader, _ = create_dataloaders(
         config,
