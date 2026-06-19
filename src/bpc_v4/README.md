@@ -23,9 +23,10 @@ Kronos 对全 0 amount 的注意力自然衰减，无需额外 mask。
 
 ## 运行
 
+在 **quant/** 项目根目录（`src/` 即 `quant_cursor` Python 包）：
+
 ```bash
-cd quant_cursor
-python -m bpc_v4.train
+python -m quant_cursor.bpc_v4.train --dev --device cuda
 ```
 
 ## 可解析性 (v4.0)
