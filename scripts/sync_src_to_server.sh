@@ -6,7 +6,8 @@
 #   export QUANT_SYNC_PORT=31407
 #   export QUANT_SYNC_USER=user
 #   export QUANT_SYNC_REMOTE=/home/user/pdl/mylab/quant/quant_cursor
-#   export QUANT_SYNC_PASSWORD='...'   # 可选；推荐 SSH key
+#   export SYNC_SSH_PASSWORD='...'   # Cloud Agent Secrets 名称
+#   export QUANT_SYNC_PASSWORD='...'   # 可选别名
 #   bash scripts/sync_src_to_server.sh
 
 set -euo pipefail
@@ -19,6 +20,9 @@ USER="${QUANT_SYNC_USER:?set QUANT_SYNC_USER}"
 REMOTE="${QUANT_SYNC_REMOTE:?set QUANT_SYNC_REMOTE}"
 
 RSYNC_SSH=(ssh -p "$PORT" -o StrictHostKeyChecking=accept-new)
+if [[ -n "${SYNC_SSH_PASSWORD:-}" ]]; then
+  export QUANT_SYNC_PASSWORD="${SYNC_SSH_PASSWORD}"
+fi
 if [[ -n "${QUANT_SYNC_PASSWORD:-}" ]]; then
   if command -v sshpass >/dev/null 2>&1; then
     RSYNC_SSH=(sshpass -p "$QUANT_SYNC_PASSWORD" ssh -p "$PORT" -o StrictHostKeyChecking=accept-new)
