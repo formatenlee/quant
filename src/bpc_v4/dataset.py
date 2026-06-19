@@ -22,6 +22,36 @@ from .kronos import KronosTokenizerPool
 logger = logging.getLogger(__name__)
 
 
+def resolve_qlib_instruments(
+    market: str = "csi300",
+    n_instruments: Optional[int] = None,
+    start: str = "2019-01-01",
+    end: str = "2024-12-31",
+    provider_uri: Path = Path("~/.qlib/qlib_data/cn_data"),
+) -> List[str]:
+    """从 qlib 市场池取标的列表，可按数量截断（用于小样本测试）。"""
+    uri = str(provider_uri.expanduser())
+    qlib.init(provider_uri=uri, region="cn")
+    all_inst = D.list_instruments(
+        instruments=D.instruments(market),
+        start_time=start,
+        end_time=end,
+        as_list=True,
+    )
+    codes = sorted(all_inst)
+    if n_instruments is not None:
+        codes = codes[:n_instruments]
+    logger.info(f"Resolved {len(codes)} instruments from qlib market={market}")
+    return codes
+
+
+def _resolve_feature_codes(instruments: List[str]):
+    """支持市场名（如 csi300）或具体 ticker 列表。"""
+    if len(instruments) == 1 and "." not in instruments[0]:
+        return D.instruments(instruments[0])
+    return instruments
+
+
 class QlibBPCV4Dataset(Dataset):
     """Qlib 数据加载 + 特征预计算 + Kronos z_q 缓存"""
 
@@ -40,7 +70,7 @@ class QlibBPCV4Dataset(Dataset):
         if not QLIB_AVAILABLE:
             raise RuntimeError("qlib 未安装")
 
-        qlib.init(provider_uri=str(config.qlib.provider_uri), region="cn")
+        qlib.init(provider_uri=str(config.qlib.provider_uri.expanduser()), region="cn")
 
         self.instruments = config.qlib.instruments
         self.start = config.qlib.start_date
@@ -55,8 +85,8 @@ class QlibBPCV4Dataset(Dataset):
         self._precompute_all()
 
     def _load_data(self):
-        codes = D.instruments(self.instruments)
-        logger.info(f"Loading {len(codes)} instruments from {self.start} to {self.end}")
+        codes = _resolve_feature_codes(self.instruments)
+        logger.info(f"Loading instruments from {self.start} to {self.end}")
 
         fields = ["$open", "$high", "$low", "$close", "$volume", "$amount"]
         df = D.features(codes, fields, start_time=self.start, end_time=self.end, freq="day")
@@ -90,6 +120,16 @@ class QlibBPCV4Dataset(Dataset):
             self._samples = self._samples[split_idx:val_idx]
         else:
             self._samples = self._samples[val_idx:]
+
+        max_samples = getattr(self.cfg.qlib, "max_samples", None)
+        if max_samples is not None and max_samples > 0:
+            if self.mode == "train":
+                cap = max(1, int(max_samples * 0.8))
+            elif self.mode == "val":
+                cap = max(1, max_samples - int(max_samples * 0.8))
+            else:
+                cap = max(1, max_samples // 10)
+            self._samples = self._samples[:cap]
 
         logger.info(f"{self.mode} samples: {len(self._samples)}")
 

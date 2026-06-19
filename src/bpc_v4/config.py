@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 
 @dataclass
@@ -77,6 +78,7 @@ class QlibConfig:
     val_ratio: float = 0.15
     test_ratio: float = 0.15
     instruments: list = field(default_factory=lambda: ["CSI300"])
+    max_samples: Optional[int] = None
 
 
 @dataclass

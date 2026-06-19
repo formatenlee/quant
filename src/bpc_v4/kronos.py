@@ -1,6 +1,7 @@
 """Kronos Tokenizer 单例封装（完全冻结，参考更优实现）"""
 
 import logging
+from pathlib import Path
 from typing import Optional, Tuple
 
 import torch
