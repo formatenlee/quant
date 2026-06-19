@@ -342,13 +342,10 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, bool]
 
 
 def _resolve_sample_cap(args: argparse.Namespace) -> int | None:
+    """每标的样本上限；默认 None = 按日期窗口内全部有效 bar。"""
     if args.full:
         return None
-    if args.max_samples_per_instrument is not None:
-        return args.max_samples_per_instrument
-    if args.max_instruments is not None:
-        return 200
-    return None
+    return args.max_samples_per_instrument
 
 
 def main() -> int:
@@ -442,7 +439,12 @@ def main() -> int:
 
     logger.info(
         "BPC-v4: instruments=%d window=%s..%s max_spi=%s qlib=%s output=%s",
-        len(instruments), start, end, max_spi, config.qlib.provider_uri, out_dir,
+        len(instruments),
+        start,
+        end,
+        max_spi if max_spi is not None else "all",
+        config.qlib.provider_uri,
+        out_dir,
     )
 
     run_training(
