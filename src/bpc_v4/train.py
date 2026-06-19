@@ -10,7 +10,7 @@ from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 
 from .config import GlobalConfig
-from .dataset import create_dataloaders
+from .dataset import create_dataloaders, resolve_qlib_instruments
 from .model import BPCV4Model
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -72,13 +72,20 @@ def eval_epoch(model, loader, device):
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="bpc_v4 训练（qlib 日线 + Kronos）")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--save_dir", type=str, default="./checkpoints/bpc_v4")
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--qlib_uri", type=str, default="~/.qlib/qlib_data/cn_data", help="qlib 数据目录")
+    parser.add_argument("--market", type=str, default="csi300", help="qlib 市场池，如 csi300/csi500")
+    parser.add_argument("--n_instruments", type=int, default=200, help="从市场池截取的标的数量")
+    parser.add_argument("--start_date", type=str, default="2019-01-01")
+    parser.add_argument("--end_date", type=str, default="2026-06-19", help="结束日期，默认今天")
+    parser.add_argument("--max_samples", type=int, default=None, help="小样本测试：限制 train+val 总窗口数")
+    parser.add_argument("--kronos_path", type=str, default=None, help="Kronos 本地模型目录（可选）")
     args = parser.parse_args()
 
     config = GlobalConfig()
@@ -88,6 +95,25 @@ def main():
     config.train.device = args.device
     config.train.save_dir = Path(args.save_dir)
     config.train.save_dir.mkdir(parents=True, exist_ok=True)
+    config.qlib.provider_uri = Path(args.qlib_uri)
+    config.qlib.start_date = args.start_date
+    config.qlib.end_date = args.end_date
+    if args.kronos_path:
+        config.kronos.local_path = args.kronos_path
+
+    instruments = resolve_qlib_instruments(
+        market=args.market,
+        n_instruments=args.n_instruments,
+        start=args.start_date,
+        end=args.end_date,
+        provider_uri=config.qlib.provider_uri,
+    )
+    config.qlib.instruments = instruments
+    config.qlib.max_samples = args.max_samples
+    logger.info(
+        f"Qlib: {len(instruments)} instruments, {args.start_date} ~ {args.end_date}, "
+        f"uri={config.qlib.provider_uri}"
+    )
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
