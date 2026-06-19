@@ -22,5 +22,12 @@ Two tightly-coupled Python products (China A-share quant research), all under `s
 - Running `python -m bpc_v4.train` end-to-end needs a populated Qlib `cn_data` dataset (`~/.qlib/qlib_data/cn_data`, NOT in the repo) plus the custom Kronos HF model `NeoQuasar/Kronos-Tokenizer-base`. Without that data it cannot train E2E; the `BPCV4Model` itself trains fine on synthetic tensors.
 - **Pre-existing breakage (not env-related):** `src/bpc_v4/quick_test.py` imports symbols that don't exist (`BPCv4Config`/`BPCv4Dataset`/`collate_fn`/`BPCv4Model`); the real entry point is `bpc_v4/train.py` with `BPCV4Model`. `bpc_v3.train` fails to import because it pulls from the stale duplicate tree `src/quant_cursor/bpc_v3/`. The nested `src/quant_cursor/` is a stale partial copy — the active code is the top level of `src/`.
 
+### Remote training server sync
+The user runs training on a remote GPU server and wants every code change pushed there immediately.
+- **Path mapping:** local `/workspace/src/`  ↔  remote `/home/user/pdl/mylab/quant/quant_cursor/` (the remote package dir is named `quant_cursor`, the local one is `src`). The remote project root `/home/user/pdl/mylab/quant/` also holds `config.yaml`, `data/`, `checkpoints/`, `requirements*.txt` that are NOT in this git repo — do not overwrite them.
+- **How:** use the git-ignored helper `/workspace/.sync_to_server.sh` (rsync over ssh, code-only, no `--delete`). Run it after editing any file under `src/`. `./.sync_to_server.sh --dry-run` previews changes.
+- **Credentials:** SSH `user@183.232.132.248:31407`. The script reads `SYNC_SSH_PASSWORD` if set; otherwise a fallback is baked into the (un-committed) script. For durability across agent sessions, store the password as a Cursor secret named `SYNC_SSH_PASSWORD` and recreate `.sync_to_server.sh` if it's missing (it is git-ignored so it won't appear in a fresh checkout).
+- The remote `requirements.txt` / `requirements-qlib.txt` / `requirements-train.txt` mirror the deps installed locally (akshare/pandas/pyarrow/pyyaml, pyqlib, torch).
+
 ### Lint / test / build
 - No lint config, no test framework, no build system are present in the repo. Use `python -m compileall src` as a syntax/build sanity check.
