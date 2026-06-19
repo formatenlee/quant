@@ -109,12 +109,12 @@ def load_materialized_dataset(path: str | Path) -> MaterializedBPCV4Dataset:
         return torch.from_numpy(np.load(npy))
 
     ds = MaterializedBPCV4Dataset(
-        z_q=_load("z_q"),
-        bpc_feat=_load("bpc_feat"),
-        ctx_feat=_load("ctx_feat"),
-        time_emb=_load("time_emb"),
-        stock_id=_load("stock_id"),
-        s1_ids=_load("s1_ids"),
+        z_q=_load("z_q").float(),
+        bpc_feat=_load("bpc_feat").float(),
+        ctx_feat=_load("ctx_feat").float(),
+        time_emb=_load("time_emb").float(),
+        stock_id=_load("stock_id").long(),
+        s1_ids=_load("s1_ids").long(),
     )
     logger.info("Loaded pre-materialized bpc_v4 dataset from %s (%d samples)", path, len(ds))
     return ds

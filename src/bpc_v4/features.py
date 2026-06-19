@@ -490,14 +490,13 @@ def compute_context_features(
 
 def compute_time_embedding(timestamps: torch.Tensor, raw_dim: int = 16) -> torch.Tensor:
     """从交易日序数生成 16 维周期编码（sin/cos）"""
-    device = timestamps.device
-    dtype = timestamps.dtype
-    B = timestamps.shape[0]
+    ts = timestamps.to(dtype=torch.float32)
+    B = ts.shape[0]
 
-    day_of_year = timestamps.float() % 365
-    day_of_week = timestamps.float() % 7
-    month = timestamps.float() % 12
-    year_phase = timestamps.float() / 365.25
+    day_of_year = ts % 365
+    day_of_week = ts % 7
+    month = ts % 12
+    year_phase = ts / 365.25
 
     periods = torch.stack([
         day_of_year / 365.25,
@@ -506,7 +505,7 @@ def compute_time_embedding(timestamps: torch.Tensor, raw_dim: int = 16) -> torch
         year_phase,
     ], dim=1)
 
-    emb = torch.zeros(B, raw_dim, device=device, dtype=dtype)
+    emb = torch.zeros(B, raw_dim, device=ts.device, dtype=torch.float32)
     for i in range(4):
         emb[:, 2 * i] = torch.sin(2 * math.pi * periods[:, i])
         emb[:, 2 * i + 1] = torch.cos(2 * math.pi * periods[:, i])

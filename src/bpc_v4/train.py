@@ -22,8 +22,25 @@ from pathlib import Path
 
 import torch
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
+
+try:
+    from torch.amp import GradScaler, autocast
+
+    def _autocast(enabled: bool):
+        return autocast("cuda", enabled=enabled)
+
+    def _grad_scaler(enabled: bool) -> GradScaler:
+        return GradScaler("cuda", enabled=enabled)
+
+except ImportError:
+    from torch.cuda.amp import GradScaler, autocast
+
+    def _autocast(enabled: bool):
+        return autocast(enabled=enabled)
+
+    def _grad_scaler(enabled: bool) -> GradScaler:
+        return GradScaler(enabled=enabled)
 
 from quant_cursor.bpc.dataset import load_qlib_instruments
 from quant_cursor.config import load_config
@@ -74,7 +91,7 @@ def train_epoch(
             batch = to_device(batch, device, non_blocking=non_blocking)
         optimizer.zero_grad()
 
-        with autocast(enabled=scaler.is_enabled()):
+        with _autocast(scaler.is_enabled()):
             outputs = model(batch)
             losses = model.compute_loss(batch, outputs)
             loss = losses["loss"]
@@ -176,7 +193,7 @@ def run_training(
     model = BPCV4Model(config).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=config.train.learning_rate, weight_decay=config.train.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.train.epochs, eta_min=1e-6)
-    scaler = GradScaler(enabled=config.train.amp and use_cuda)
+    scaler = _grad_scaler(config.train.amp and use_cuda)
 
     start_epoch = 0
     if resume and Path(resume).exists():

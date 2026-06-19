@@ -55,7 +55,7 @@ class BPCV4Model(nn.Module):
         ctx_norm = self.norm_ctx(batch["ctx_feat"])
 
         stock_emb = self.stock_embed(batch["stock_id"])
-        time_emb = self.time_proj(batch["time_emb"])
+        time_emb = self.time_proj(batch["time_emb"].float())
         emb = torch.cat([stock_emb, time_emb], dim=-1)
 
         fused = torch.cat([z_norm, bpc_norm, ctx_norm, emb], dim=-1)
