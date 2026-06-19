@@ -265,4 +265,14 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # 统一走 quant_cursor 入口（与 v3 一致，支持 --max-instruments 等参数）
+    try:
+        from quant_cursor.bpc_v4.train import main as _qc_main
+
+        raise SystemExit(_qc_main())
+    except ImportError:
+        logger.warning(
+            "quant_cursor.bpc_v4 未找到，回退到 bpc_v4.train 旧入口；"
+            "请确认 PYTHONPATH 包含 src/ 且已 git pull 最新代码"
+        )
+        main()

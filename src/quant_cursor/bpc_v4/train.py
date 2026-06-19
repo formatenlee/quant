@@ -173,6 +173,7 @@ def _resolve_sample_cap(args: argparse.Namespace) -> int | None:
 
 
 def main() -> int:
+    logger.info("BPC-v4 entry: %s", Path(__file__).resolve())
     args, small_data = parse_args()
     _apply_dev_preset(args)
     if small_data:
