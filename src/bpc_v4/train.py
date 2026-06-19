@@ -403,6 +403,17 @@ def main() -> int:
     config.qlib.val_ratio = args.val_ratio
     if args.kronos_path:
         config.kronos.local_path = args.kronos_path
+    else:
+        from .kronos import resolve_kronos_local_path
+
+        resolved = resolve_kronos_local_path(None)
+        if resolved:
+            config.kronos.local_path = resolved
+        else:
+            logger.warning(
+                "未找到本地 Kronos 模型，将尝试 HuggingFace；"
+                "可设置 --kronos-path 或 export KRONOS_PATH=/path/to/Kronos-Tokenizer-base"
+            )
 
     num_workers = args.num_workers
     if args.gpu_cache_data or (args.batched_gpu and not args.batched_gpu_cpu):

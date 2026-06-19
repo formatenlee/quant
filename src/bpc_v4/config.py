@@ -12,7 +12,7 @@ class KronosConfig:
     seq_len: int = 40
     d_model: int = 768
     amount_pad_zero: bool = True
-    local_path: str = r"E:\quant_cursor\models\NeoQuasar\Kronos-Tokenizer-base"
+    local_path: str = ""  # 空则自动探测；见 kronos.resolve_kronos_local_path
 
 
 @dataclass

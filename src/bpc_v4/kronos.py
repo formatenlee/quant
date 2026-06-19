@@ -1,6 +1,7 @@
 """Kronos Tokenizer 单例封装（完全冻结，参考更优实现）"""
 
 import logging
+import os
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -8,6 +9,46 @@ import torch
 import torch.nn as nn
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_KRONOS_SUBPATH = Path("NeoQuasar/Kronos-Tokenizer-base")
+
+
+def resolve_kronos_local_path(explicit: Optional[str] = None) -> Optional[str]:
+    """解析 Kronos 本地目录，避免在无网环境误走 HuggingFace。"""
+    candidates: list[Path] = []
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+    for env_key in ("KRONOS_PATH", "BPC_V4_KRONOS_PATH"):
+        env_val = os.environ.get(env_key)
+        if env_val:
+            candidates.append(Path(env_val).expanduser())
+
+    candidates.extend([
+        Path("/home/user/pdl/models") / DEFAULT_KRONOS_SUBPATH,
+        Path.home() / "pdl/models" / DEFAULT_KRONOS_SUBPATH,
+        Path.home() / "models" / DEFAULT_KRONOS_SUBPATH,
+    ])
+
+    try:
+        from quant_cursor.config import load_config
+
+        root = load_config().data_dir.parent  # quant/
+        candidates.append(root.parent / "pdl/models" / DEFAULT_KRONOS_SUBPATH)
+        candidates.append(root / "models" / DEFAULT_KRONOS_SUBPATH)
+    except Exception:
+        pass
+
+    seen: set[str] = set()
+    for path in candidates:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        if path.is_dir() and (path / "config.json").exists():
+            resolved = str(path.resolve())
+            logger.info("Resolved Kronos local path: %s", resolved)
+            return resolved
+    return None
 
 
 class KronosTokenizerPool:
@@ -45,11 +86,17 @@ class KronosTokenizerPool:
             raise ImportError("请安装 transformers: pip install transformers")
 
         if self._local_path and Path(self._local_path).exists():
-            logger.info(f"正在从本地路径加载 Kronos Tokenizer: {self._local_path}")
+            logger.info("正在从本地路径加载 Kronos Tokenizer: %s", self._local_path)
             self._tokenizer = AutoModel.from_pretrained(self._local_path, local_files_only=True)
         else:
-            logger.info(f"正在从 HuggingFace 加载 Kronos Tokenizer: {self._model_name}")
-            self._tokenizer = AutoModel.from_pretrained(self._model_name)
+            resolved = resolve_kronos_local_path(self._local_path)
+            if resolved:
+                self._local_path = resolved
+                logger.info("正在从本地路径加载 Kronos Tokenizer: %s", resolved)
+                self._tokenizer = AutoModel.from_pretrained(resolved, local_files_only=True)
+            else:
+                logger.info("正在从 HuggingFace 加载 Kronos Tokenizer: %s", self._model_name)
+                self._tokenizer = AutoModel.from_pretrained(self._model_name)
 
         self._tokenizer.eval()
         self._tokenizer.to(self._device)
