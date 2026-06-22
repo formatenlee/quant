@@ -55,8 +55,8 @@ class BPCV4Model(nn.Module):
         self.codebook_weight = config.head.codebook_weight
 
     def _codebook_targets(self, s1_ids: torch.Tensor) -> torch.Tensor:
-        """Kronos s1 为 10-bit 索引；head 为 codebook_output_dim 类，取模对齐。"""
-        return s1_ids[:, -1].long().remainder(self.num_codebook_classes)
+        """Kronos s1 token id（末 bar），与 codebook_head 全词表一一对应。"""
+        return s1_ids[:, -1].long()
 
     def forward(self, batch: dict) -> dict:
         z_q = _sanitize(batch["z_q"].float(), clamp=10.0)
@@ -100,6 +100,11 @@ class BPCV4Model(nn.Module):
         purity_loss = F.kl_div(log_probs, target_probs, reduction="batchmean")
 
         s1_target = self._codebook_targets(batch["s1_ids"])
+        if s1_target.max().item() >= self.num_codebook_classes:
+            raise ValueError(
+                f"s1_id {s1_target.max().item()} >= codebook classes {self.num_codebook_classes}; "
+                "请运行 sync_kronos_config 或 --force-rebuild-preprocessed"
+            )
         codebook_loss = F.cross_entropy(codebook_logits, s1_target)
 
         total_loss = self.purity_weight * purity_loss + self.codebook_weight * codebook_loss

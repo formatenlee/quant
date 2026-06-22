@@ -11,6 +11,7 @@ class KronosConfig:
     revision: str = "main"
     seq_len: int = 40
     d_model: int = 20  # z_q = s1_bits + s2_bits；训练前由 sync_kronos_config 校验
+    s1_bits: int = 10  # 由 sync_kronos_config 从 tokenizer config 同步
     amount_pad_zero: bool = True
     local_path: str = ""  # 空则自动探测；见 kronos.resolve_kronos_local_path
 
@@ -51,7 +52,7 @@ class FusionConfig:
 class HeadConfig:
     purity_output_dim: int = 15
     purity_weight: float = 1.0
-    codebook_output_dim: int = 64  # Kronos s1 取模映射到此类别数
+    codebook_output_dim: int = 1024  # 2**s1_bits；由 sync_kronos_config 与 Kronos 对齐
     codebook_weight: float = 0.5
 
 

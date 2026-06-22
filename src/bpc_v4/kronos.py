@@ -68,12 +68,42 @@ def read_kronos_z_q_dim(local_path: Optional[str] = None) -> int:
     return int(cfg.get("s1_bits", 10) + cfg.get("s2_bits", 10))
 
 
+def read_kronos_s1_bits(local_path: Optional[str] = None) -> int:
+    """从 tokenizer config.json 读取 s1_bits。"""
+    path = local_path or resolve_kronos_local_path()
+    if not path:
+        return 10
+    cfg_path = Path(path) / "config.json"
+    if not cfg_path.exists():
+        return 10
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    return int(cfg.get("s1_bits", 10))
+
+
+def read_kronos_s1_vocab_size(local_path: Optional[str] = None) -> int:
+    return 2 ** read_kronos_s1_bits(local_path)
+
+
 def sync_kronos_config(config) -> None:
-    """将 GlobalConfig.kronos.d_model 对齐到 tokenizer 的 z_q 维度。"""
-    z_q_dim = read_kronos_z_q_dim(config.kronos.local_path or None)
+    """将 kronos / head 维度与 tokenizer 配置对齐。"""
+    local_path = config.kronos.local_path or None
+    z_q_dim = read_kronos_z_q_dim(local_path)
     if config.kronos.d_model != z_q_dim:
         logger.info("Sync kronos.d_model: %d -> %d (z_q codebook dim)", config.kronos.d_model, z_q_dim)
         config.kronos.d_model = z_q_dim
+
+    s1_bits = read_kronos_s1_bits(local_path)
+    s1_vocab = 2 ** s1_bits
+    if config.kronos.s1_bits != s1_bits:
+        logger.info("Sync kronos.s1_bits: %d -> %d", config.kronos.s1_bits, s1_bits)
+        config.kronos.s1_bits = s1_bits
+    if config.head.codebook_output_dim != s1_vocab:
+        logger.info(
+            "Sync head.codebook_output_dim: %d -> %d (full Kronos s1 vocabulary)",
+            config.head.codebook_output_dim,
+            s1_vocab,
+        )
+        config.head.codebook_output_dim = s1_vocab
 
 
 class KronosTokenizerPool:

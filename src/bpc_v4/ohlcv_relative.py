@@ -78,6 +78,35 @@ class CrossSectionDeltaMedians:
         )
         return cls(day=day_med, week=week_med)
 
+    @classmethod
+    def from_v4_store(cls, store) -> CrossSectionDeltaMedians:
+        """从 BPCV4InstrumentStore 构建截面 Δ 中值（与 v3 一致，仅日线）。"""
+        date_to_ordinal = {d: i for i, d in enumerate(store.calendar)}
+        n_cal = len(store.calendar)
+        day_buckets: list[list[np.ndarray]] = [[] for _ in range(n_cal)]
+
+        for series in store._cache.values():
+            ohlcv = series.ohlcva[:, :NUM_OHLCV_FIELDS]
+            for t in range(1, len(ohlcv)):
+                d = series.dates[t]
+                o = date_to_ordinal.get(d, -1)
+                if o < 0:
+                    continue
+                day_buckets[o].append(ohlcv[t] - ohlcv[t - 1])
+
+        day_med = np.zeros((n_cal, NUM_OHLCV_FIELDS), dtype=np.float32)
+        week_med = np.zeros((1, NUM_OHLCV_FIELDS), dtype=np.float32)
+        for o in range(n_cal):
+            if day_buckets[o]:
+                day_med[o] = np.median(np.stack(day_buckets[o], axis=0), axis=0)
+
+        logger.info(
+            "CrossSectionDeltaMedians (v4): calendar=%d, day_nonempty=%d",
+            n_cal,
+            sum(1 for b in day_buckets if b),
+        )
+        return cls(day=day_med, week=week_med)
+
 
 def _bar_ordinals_for_window(
     dates,

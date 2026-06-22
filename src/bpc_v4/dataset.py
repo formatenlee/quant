@@ -24,7 +24,7 @@ from quant_cursor.bpc.dataset import TemporalSplit, ensure_qlib, load_trading_ca
 
 from .config import GlobalConfig
 from .features import compute_bpc_features, compute_context_features, compute_time_embedding
-from .ohlcv_relative import absolute_window_to_relative
+from .ohlcv_relative import CrossSectionDeltaMedians, absolute_window_to_relative
 from .kronos import KronosTokenizerPool
 from .materialize import (
     BatchedGpuBPCV4Dataset,
@@ -93,6 +93,7 @@ class BPCV4InstrumentStore:
             raise RuntimeError("BPC-v4 InstrumentStore: 无有效标的")
 
         self.symbol_to_id: Dict[str, int] = {qlib_id: i for i, qlib_id in enumerate(self._cache.keys())}
+        self.date_to_ordinal: Dict[pd.Timestamp, int] = {d: i for i, d in enumerate(self.calendar)}
         logger.info(
             "BPC-v4 InstrumentStore ready: %d instruments, window=%s..%s",
             len(self._cache),
@@ -224,8 +225,15 @@ def materialize_samples(
     samples: List[Tuple[str, int]],
     store: BPCV4InstrumentStore,
     *,
+    cs_medians: CrossSectionDeltaMedians,
     share_memory: bool = False,
 ) -> MaterializedBPCV4Dataset:
+    """
+    双路径物化（与 v3 设计一致）：
+    - Kronos：绝对 OHLCVA → z_q, s1_ids
+    - BPC 行为/结构：v3 相对化 OHLCV → 26 维特征 + 7 维上下文
+    最终在 BPCV4Model 融合层整合。
+    """
     seq_len = config.kronos.seq_len
     kronos = KronosTokenizerPool(
         model_name=config.kronos.model_name,
@@ -237,23 +245,28 @@ def materialize_samples(
     n_total = len(samples)
 
     for i, (sym, t_idx) in enumerate(samples):
-        arr = store._cache[sym].ohlcva
+        series = store._cache[sym]
+        arr = series.ohlcva
         window = arr[t_idx - seq_len : t_idx]
         prev_bar = arr[t_idx - seq_len - 1]
 
-        ohlcv = torch.from_numpy(window[:, :5]).float().unsqueeze(0)
+        # Kronos：绝对量（预训练 tokenizer 的输入约定）
+        ohlcv_abs = torch.from_numpy(window[:, :5]).float().unsqueeze(0)
         amount = torch.from_numpy(window[:, 5:6]).float().unsqueeze(0)
-        ohlcva = torch.cat([ohlcv, amount], dim=-1)
+        ohlcva_abs = torch.cat([ohlcv_abs, amount], dim=-1)
 
-        z_q, s1_ids, _ = kronos.encode(ohlcva)
+        z_q, s1_ids, _ = kronos.encode(ohlcva_abs)
         z_q_list.append(_sanitize_tensor(z_q.squeeze(0)).cpu())
         s1_list.append(s1_ids.squeeze(0).cpu())
 
+        # BPC：v3 相对化 OHLCV（截面中心化 field-Δ）
         vol_ctx = torch.zeros(1, 3)
         prev_bar_np = prev_bar[:5].astype(np.float32)
-        bar_ords = np.arange(seq_len, dtype=np.int64)
-        cs_zero = np.zeros((seq_len + 1, 5), dtype=np.float32)
-        rel_window = absolute_window_to_relative(window[:, :5], prev_bar_np, bar_ords, cs_zero)
+        bar_ords = np.array(
+            [store.date_to_ordinal.get(series.dates[t], 0) for t in range(t_idx - seq_len, t_idx)],
+            dtype=np.int64,
+        )
+        rel_window = absolute_window_to_relative(window[:, :5], prev_bar_np, bar_ords, cs_medians.day)
         rel_ohlcv = torch.from_numpy(rel_window).float().unsqueeze(0)
         prev_bar_t = torch.from_numpy(prev_bar_np).float().unsqueeze(0)
         bpc_list.append(compute_bpc_features(rel_ohlcv, vol_ctx, prev_bar_t).squeeze(0).cpu())
@@ -334,6 +347,7 @@ def build_datasets(
         calendar=calendar,
         pad_missing_amount=config.kronos.amount_pad_zero,
     )
+    cs_medians = CrossSectionDeltaMedians.from_v4_store(store)
     seq_len = config.kronos.seq_len
     train_samples = _build_split_samples(
         store, split, "train", seq_len,
@@ -348,8 +362,8 @@ def build_datasets(
 
     logger.info("Materializing train=%d val=%d samples (no separate test pass)", len(train_samples), len(val_samples))
 
-    train_ds = materialize_samples(config, train_samples, store, share_memory=share_memory)
-    val_ds = materialize_samples(config, val_samples, store, share_memory=share_memory)
+    train_ds = materialize_samples(config, train_samples, store, cs_medians=cs_medians, share_memory=share_memory)
+    val_ds = materialize_samples(config, val_samples, store, cs_medians=cs_medians, share_memory=share_memory)
     test_ds = val_ds
 
     if save_preprocessed:
@@ -367,6 +381,8 @@ def build_datasets(
             "instrument_ids": list(store._cache.keys()),
             "max_samples": config.qlib.max_samples,
             "max_samples_per_instrument": max_samples_per_instrument,
+            "codebook_output_dim": config.head.codebook_output_dim,
+            "kronos_s1_bits": config.kronos.s1_bits,
             "train_samples": len(train_ds),
             "val_samples": len(val_ds),
         }
