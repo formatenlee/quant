@@ -51,7 +51,7 @@ class FusionConfig:
 class HeadConfig:
     purity_output_dim: int = 15
     purity_weight: float = 1.0
-    codebook_output_dim: int = 64  # 适配 s1_ids
+    codebook_output_dim: int = 64  # Kronos s1 取模映射到此类别数
     codebook_weight: float = 0.5
 
 

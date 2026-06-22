@@ -24,6 +24,7 @@ from quant_cursor.bpc.dataset import TemporalSplit, ensure_qlib, load_trading_ca
 
 from .config import GlobalConfig
 from .features import compute_bpc_features, compute_context_features, compute_time_embedding
+from .ohlcv_relative import absolute_window_to_relative
 from .kronos import KronosTokenizerPool
 from .materialize import (
     BatchedGpuBPCV4Dataset,
@@ -38,6 +39,10 @@ from .materialize import (
 logger = logging.getLogger(__name__)
 
 OHLCVA_FIELDS = ["$open", "$high", "$low", "$close", "$volume", "$amount"]
+
+
+def _sanitize_tensor(t: torch.Tensor) -> torch.Tensor:
+    return torch.nan_to_num(t.float(), nan=0.0, posinf=0.0, neginf=0.0)
 
 
 @dataclass
@@ -241,13 +246,18 @@ def materialize_samples(
         ohlcva = torch.cat([ohlcv, amount], dim=-1)
 
         z_q, s1_ids, _ = kronos.encode(ohlcva)
-        z_q_list.append(z_q.squeeze(0).cpu())
+        z_q_list.append(_sanitize_tensor(z_q.squeeze(0)).cpu())
         s1_list.append(s1_ids.squeeze(0).cpu())
 
         vol_ctx = torch.zeros(1, 3)
-        prev_bar_t = torch.from_numpy(prev_bar[:5]).float().unsqueeze(0)
-        bpc_list.append(compute_bpc_features(ohlcv, vol_ctx, prev_bar_t).squeeze(0).cpu())
-        ctx_list.append(compute_context_features(ohlcv, vol_ctx, prev_bar_t).squeeze(0).cpu())
+        prev_bar_np = prev_bar[:5].astype(np.float32)
+        bar_ords = np.arange(seq_len, dtype=np.int64)
+        cs_zero = np.zeros((seq_len + 1, 5), dtype=np.float32)
+        rel_window = absolute_window_to_relative(window[:, :5], prev_bar_np, bar_ords, cs_zero)
+        rel_ohlcv = torch.from_numpy(rel_window).float().unsqueeze(0)
+        prev_bar_t = torch.from_numpy(prev_bar_np).float().unsqueeze(0)
+        bpc_list.append(compute_bpc_features(rel_ohlcv, vol_ctx, prev_bar_t).squeeze(0).cpu())
+        ctx_list.append(compute_context_features(rel_ohlcv, vol_ctx, prev_bar_t).squeeze(0).cpu())
         time_list.append(
             compute_time_embedding(
                 torch.tensor([t_idx], dtype=torch.long),

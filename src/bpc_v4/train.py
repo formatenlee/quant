@@ -93,8 +93,22 @@ def train_epoch(
 
         with _autocast(scaler.is_enabled()):
             outputs = model(batch)
+        with _autocast(False):
             losses = model.compute_loss(batch, outputs)
             loss = losses["loss"]
+
+        if not torch.isfinite(loss):
+            logger.error(
+                "Non-finite loss at step %d: loss=%s purity=%s codebook=%s",
+                steps + 1,
+                loss.item(),
+                losses["purity_loss"].item(),
+                losses["codebook_loss"].item(),
+            )
+            raise RuntimeError(
+                "训练 loss 非有限值 (NaN/Inf)。常见原因：s1_ids 超出 codebook 类别、"
+                "输入含 NaN、或 AMP 溢出。请更新代码后 --force-rebuild-preprocessed 重试。"
+            )
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -139,7 +153,7 @@ def eval_epoch(
         total_codebook += losses["codebook_loss"].item()
 
         pred = outputs["codebook_logits"].argmax(dim=-1)
-        target = batch["s1_ids"][:, -1]
+        target = model._codebook_targets(batch["s1_ids"])
         total_acc += (pred == target).float().mean().item()
         steps += 1
 
