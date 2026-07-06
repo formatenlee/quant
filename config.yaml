@@ -1,0 +1,70 @@
+# 数据存储根目录
+data_dir: data
+
+# 请求间隔（秒）
+request_delay: 5.0
+request_jitter: 0.0
+
+# 失败重试（封 IP 时减少重试、拉长退避）
+max_retries: 2
+retry_backoff: 45.0
+
+# 连续失败熔断：暂停后自动恢复
+ban_consecutive_failures: 5
+ban_cooldown_seconds: 900
+
+# 切换数据源前的额外等待
+fallback_delay: 20.0
+
+# 每完成 N 次请求额外暂停
+batch_pause_every: 50
+batch_pause_seconds: 30
+
+# 当日行情一般在 21:00 后更新（Asia/Shanghai）
+today_update_hour: 21
+timezone: Asia/Shanghai
+
+# 是否包含 ETF
+include_etf: true
+
+# 是否包含债券类指数
+include_bond_indices: false
+
+# 东方财富指数分类（用于补充 universe）
+em_index_categories:
+  - 沪深重要指数
+  - 上证系列指数
+  - 深证系列指数
+  - 中证系列指数
+
+# Qlib 导出目录（相对 data_dir）
+qlib_staging_subdir: qlib_staging
+qlib_week_staging_subdir: qlib_staging_week
+qlib_min_staging_subdir: qlib_staging_1min
+qlib_deriv_staging_subdir: qlib_staging_deriv
+qlib_data_subdir: qlib_data
+
+# 金融衍生品（期货 + 期权事件，不含商品）
+derivatives_subdir: derivatives
+derivatives_futures_subdir: derivatives/futures
+
+# 分钟级原始 parquet（相对 data_dir）
+indices_min_subdir: indices_min
+etf_min_subdir: etf_min
+# 东财分钟周期：1/5/15/30/60；5 分钟可拉更长近期历史，1 分钟仅约最近 5 日
+minute_period: "5"
+minute_request_delay: 8.0
+# 分钟数据源：sina（新浪 K 线，较稳）| em（东财）| auto（先 sina 后 em）
+minute_data_source: auto
+minute_max_retries: 4
+
+# A 股
+include_stocks: true
+stock_request_delay: 6.0
+stock_batch_pause_every: 30
+stock_batch_pause_seconds: 45.0
+incremental_overlap_days: 5
+adjust_mode: qfq
+large_cap_min_mv: 50000000000
+sw_l2_mapping_refresh_days: 7
+sample_validation_count: 20
