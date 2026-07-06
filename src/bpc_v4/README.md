@@ -25,6 +25,33 @@ Kronos 对全 0 amount 的注意力自然衰减，无需额外 mask。
 
 在 **quant/** 项目根目录（`src/` 即 `quant_cursor` Python 包）：
 
+### 1. Kronos 预计算（一次性，与 BPC 物化解耦）
+
+```bash
+python -m quant_cursor.bpc_v4.precompute_kronos \
+  --full --start 2015-01-01 --end 2024-12-31 \
+  --cpu-threads 4 \
+  --kronos-path /path/to/Kronos-Tokenizer-base \
+  --output-dir data/kronos_cache
+```
+
+- 按标的分片缓存 `z_q` / `s1_ids` 到 `data/kronos_cache/instruments/`
+- **输入**：每个窗口做 per-window z-score + clip(±5)（与 Kronos 官方 `KronosPredictor` 一致）；未归一化会导致 `s1_ids` 坍缩为常数
+- 缓存 schema：`kronos_cache_v2`（含 `ohlcva_norm=per_window_zscore_clip5`）
+- 增量：已有分片跳过；`--force-rebuild` 覆盖单标的分片
+- 物化/训练变更 BPC 特征时**无需重跑 Kronos**
+
+### 2. 训练
+
+```bash
+python -m quant_cursor.bpc_v4.train --dev --device cuda \
+  --kronos-cache-dir data/kronos_cache
+```
+
+- 默认自动探测 `data/kronos_cache/meta.json`
+- `--force-rebuild-preprocessed` 仅重建 BPC 路径（快）
+- 调试可加 `--allow-live-kronos` 在线编码（慢）
+
 ```bash
 python -m quant_cursor.bpc_v4.train --dev --device cuda
 ```
@@ -40,7 +67,6 @@ python -m quant_cursor.bpc_v4.train --dev --device cuda
 
 ## Codebook 伪标签策略（方案 A）
 
-- **短期（v4.0）**：`codebook_head` 输出维度 = **64**，直接使用 Kronos `s1_ids`（vocab=64）作为静态伪标签。
-  - `CrossEntropyLoss` 要求 `num_classes` 与标签最大值+1 严格相等，此方案完全匹配。
-  - 训练稳定，可验证融合特征对 Kronos 原始粒度的保留能力。
-- **长期（方案 B）**：若需对齐 BPC-v3 的 256 码本，只需将 `codebook_head` 改为 `Linear(256→256)`，并切换伪标签源为 K-Means（K=256）聚类中心即可，改动极小。
+- `codebook_head` 输入为 **BPC + ctx + emb**（**不含 z_q**），避免从 Kronos 潜变量直接读出 `s1_ids` 的平凡解。
+- 监督目标：Kronos `s1_ids`（vocab=2^s1_bits），验证 BPC 行为特征能否对齐 Kronos 离散粒度。
+- `purity_head` 仍使用 **z_q + BPC + ctx + emb** 全路径融合。

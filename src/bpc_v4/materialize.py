@@ -13,8 +13,17 @@ from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
 
-BPC_V4_SCHEMA = "bpc_v4"
-FIELD_NAMES = ("z_q", "bpc_feat", "ctx_feat", "time_emb", "stock_id", "s1_ids")
+BPC_V4_SCHEMA = "bpc_v4_v4"
+FIELD_NAMES = (
+    "z_q",
+    "bpc_feat",
+    "ctx_feat",
+    "time_emb",
+    "stock_id",
+    "s1_ids",
+    "purity_target",
+    "next_day_sign",
+)
 
 
 class MaterializedBPCV4Dataset(Dataset):
@@ -29,6 +38,8 @@ class MaterializedBPCV4Dataset(Dataset):
         time_emb: torch.Tensor,
         stock_id: torch.Tensor,
         s1_ids: torch.Tensor,
+        purity_target: torch.Tensor,
+        next_day_sign: torch.Tensor | None = None,
     ):
         self._z_q = z_q
         self._bpc_feat = bpc_feat
@@ -36,7 +47,11 @@ class MaterializedBPCV4Dataset(Dataset):
         self._time_emb = time_emb
         self._stock_id = stock_id
         self._s1_ids = s1_ids
+        self._purity_target = purity_target
         n = z_q.shape[0]
+        if next_day_sign is None:
+            next_day_sign = torch.zeros(n, dtype=torch.float32)
+        self._next_day_sign = next_day_sign.reshape(n).float()
         for name, t in self._fields().items():
             if t.shape[0] != n:
                 raise ValueError(f"{name} batch dim {t.shape[0]} != {n}")
@@ -49,6 +64,8 @@ class MaterializedBPCV4Dataset(Dataset):
             "time_emb": self._time_emb,
             "stock_id": self._stock_id,
             "s1_ids": self._s1_ids,
+            "purity_target": self._purity_target,
+            "next_day_sign": self._next_day_sign,
         }
 
     def share_memory_(self) -> MaterializedBPCV4Dataset:
@@ -63,6 +80,29 @@ class MaterializedBPCV4Dataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         return {name: getattr(self, f"_{name}")[idx] for name in FIELD_NAMES}
+
+    def make_contiguous(self) -> MaterializedBPCV4Dataset:
+        """物化后压紧内存布局，加速后续 GPU 一次性上传。"""
+        for name in FIELD_NAMES:
+            t = getattr(self, f"_{name}")
+            if not t.is_contiguous():
+                setattr(self, f"_{name}", t.contiguous())
+        return self
+
+
+def dataset_memory_bytes(ds: MaterializedBPCV4Dataset) -> int:
+    """数据集 CPU 张量占用字节数。"""
+    total = 0
+    for name in FIELD_NAMES:
+        t = getattr(ds, f"_{name}")
+        total += t.numel() * t.element_size()
+    return total
+
+
+def log_dataset_memory(ds: MaterializedBPCV4Dataset, *, label: str) -> float:
+    mib = dataset_memory_bytes(ds) / (1024 * 1024)
+    logger.info("CPU resident [%s]: %d samples, %.1f MiB", label, len(ds), mib)
+    return mib
 
 
 def pin_dataset_share_memory(ds: MaterializedBPCV4Dataset) -> None:
@@ -79,7 +119,9 @@ def save_materialized_dataset(ds: MaterializedBPCV4Dataset, path: str | Path) ->
         "bpc_feat_dim": ds._bpc_feat.shape[-1],
         "ctx_feat_dim": ds._ctx_feat.shape[-1],
         "time_emb_dim": ds._time_emb.shape[-1],
+        "purity_target_dim": ds._purity_target.shape[-1],
         "s1_ids_shape": list(ds._s1_ids.shape),
+        "has_next_day_sign": True,
     }
     (path / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
@@ -96,10 +138,16 @@ def load_materialized_dataset(path: str | Path) -> MaterializedBPCV4Dataset:
         raise FileNotFoundError(f"预处理目录不存在: {path}")
 
     meta = json.loads((path / "meta.json").read_text(encoding="utf-8"))
-    if meta.get("schema_version") != BPC_V4_SCHEMA:
+    schema = meta.get("schema_version")
+    if schema not in (BPC_V4_SCHEMA, "bpc_v4_v3", "bpc_v4_v2", "bpc_v4"):
         raise ValueError(
-            f"schema_version {meta.get('schema_version')!r} != {BPC_V4_SCHEMA!r}; "
-            "请用 bpc_v4 --save-preprocessed 重新物化"
+            f"schema_version {schema!r} 不受支持（当前需要 {BPC_V4_SCHEMA!r}）；"
+            "请用 --force-rebuild-preprocessed 重新物化"
+        )
+    if schema in ("bpc_v4", "bpc_v4_v2") or not (path / "purity_target.npy").exists():
+        raise ValueError(
+            f"预处理缓存 schema={schema!r} 已过期（需 {BPC_V4_SCHEMA}，含 lag1 截面中值）。"
+            "请使用当前版本重新物化: --force-rebuild-preprocessed"
         )
 
     def _load(name: str) -> torch.Tensor:
@@ -108,6 +156,19 @@ def load_materialized_dataset(path: str | Path) -> MaterializedBPCV4Dataset:
             raise FileNotFoundError(f"Missing {name}.npy in {path}")
         return torch.from_numpy(np.load(npy))
 
+    n_samples = int(meta["n_samples"])
+    next_day_sign: torch.Tensor | None = None
+    if (path / "next_day_sign.npy").exists():
+        next_day_sign = _load("next_day_sign").float()
+    elif schema == BPC_V4_SCHEMA:
+        raise FileNotFoundError(f"Missing next_day_sign.npy in {path}")
+    else:
+        logger.warning(
+            "缓存 schema=%s 无 next_day_sign；次日方向监控不可用，请 --force-rebuild-preprocessed",
+            schema,
+        )
+        next_day_sign = torch.zeros(n_samples, dtype=torch.float32)
+
     ds = MaterializedBPCV4Dataset(
         z_q=_load("z_q").float(),
         bpc_feat=_load("bpc_feat").float(),
@@ -115,6 +176,8 @@ def load_materialized_dataset(path: str | Path) -> MaterializedBPCV4Dataset:
         time_emb=_load("time_emb").float(),
         stock_id=_load("stock_id").long(),
         s1_ids=_load("s1_ids").long(),
+        purity_target=_load("purity_target").float(),
+        next_day_sign=next_day_sign,
     )
     logger.info("Loaded pre-materialized bpc_v4 dataset from %s (%d samples)", path, len(ds))
     return ds
@@ -209,11 +272,16 @@ class BatchedGpuBPCV4Dataset(Dataset):
             self.on_epoch_begin()
 
         logger.info(
-            "BatchedGpuBPCV4Dataset: %d batches @ %d on %s",
+            "BatchedGpuBPCV4Dataset: %d batches @ %d on %s (%.1f MiB GPU resident, zero H2D per step)",
             self.num_batches,
             batch_size,
             self.device,
+            self._gpu_mib(),
         )
+
+    def _gpu_mib(self) -> float:
+        total = sum(t.numel() * t.element_size() for t in self._field_tensors)
+        return total / (1024 * 1024)
 
     def on_epoch_begin(self) -> None:
         if self.shuffle:

@@ -23,6 +23,7 @@ class BPCConfig:
     behavior_dim: int = 5
     num_agents: int = 5
     num_classes_per_agent: int = 3
+    label_temperature: float = 0.12  # 与 v3 DEFAULT_SYMBOLIC_LABEL_TEMPERATURE 一致
 
 
 @dataclass
@@ -52,8 +53,14 @@ class FusionConfig:
 class HeadConfig:
     purity_output_dim: int = 15
     purity_weight: float = 1.0
+    # Kronos s1 词表大小；仅数据审计 / meta，不参与训练 loss
     codebook_output_dim: int = 1024  # 2**s1_bits；由 sync_kronos_config 与 Kronos 对齐
-    codebook_weight: float = 0.5
+
+
+@dataclass
+class PreprocessConfig:
+    """物化 / Kronos 预计算（纯 CPU，多线程）。"""
+    cpu_threads: int = 4
 
 
 @dataclass
@@ -66,6 +73,7 @@ class TrainingConfig:
     max_grad_norm: float = 1.0
     amp: bool = True
     log_interval: int = 50
+    log_every: int = 1  # 每 N epoch 打印一次控制台指标摘要
     eval_interval: int = 5
     save_dir: Path = Path("./checkpoints/bpc_v4")
     device: str = "cuda"
@@ -90,5 +98,6 @@ class GlobalConfig:
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     fusion: FusionConfig = field(default_factory=FusionConfig)
     head: HeadConfig = field(default_factory=HeadConfig)
+    preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
     train: TrainingConfig = field(default_factory=TrainingConfig)
     qlib: QlibConfig = field(default_factory=QlibConfig)

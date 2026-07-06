@@ -435,6 +435,19 @@ def compute_behavior_proxies_stacked(
     ).to(dtype=torch.float32)
 
 
+def compute_purity_targets_from_proxies(
+    proxy_mat: torch.Tensor,
+    *,
+    temperature: float = DEFAULT_SYMBOLIC_LABEL_TEMPERATURE,
+) -> torch.Tensor:
+    """5 代理 × 3 档软标签 → [B, 15]，与 v3 symbolic_labels 一致。"""
+    labels: list[torch.Tensor] = []
+    for j, name in enumerate(BEHAVIOR_AGENT_NAMES):
+        lo, hi = SYMBOLIC_THRESHOLDS[name]
+        labels.append(symbolic_labels(proxy_mat[:, j], lo, hi, temperature=temperature))
+    return torch.cat(labels, dim=-1)
+
+
 def symbolic_labels(
     values: torch.Tensor,
     low: float,

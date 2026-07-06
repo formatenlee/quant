@@ -1,0 +1,17 @@
+# 追加到 ~/.ssh/config（Windows: %USERPROFILE%\.ssh\config）
+# 配置后可用: ssh quant-bpc-v4
+# 服务器信息: user@183.232.132.248:31407
+# 密码: lUPqn25UFfeJr
+# 远程目录: /home/user/pdl/mylab/quant/quant_cursor
+# 本地 v4 代码: E:\mylab\quant\src\bpc_v4
+
+Host quant-bpc-v4
+    HostName 183.232.132.248
+    Port 31407
+    User user
+    # 建议配置公钥后取消密码登录:
+    # IdentityFile ~/.ssh/id_ed25519_quant
+    # 首次连接会提示输入密码 lUPqn25UFfeJr
+
+# 同步命令示例 (使用 rsync over ssh, Windows 需安装 rsync 或使用 Git Bash / WSL):
+# rsync -avz --delete -e "ssh -p 31407" E:/mylab/quant/src/bpc_v4/ user@183.232.132.248:/home/user/pdl/mylab/quant/quant_cursor/bpc_v4/

@@ -57,7 +57,10 @@ class VolatilityStats:
 
         for qlib_id, series in store._cache.items():
             sid = store.symbol_to_id[qlib_id]
-            close = series.ohlcv[:, 3].astype(np.float64)
+            if hasattr(series, "ohlcva"):
+                close = series.ohlcva[:, 3].astype(np.float64)
+            else:
+                close = series.ohlcv[:, 3].astype(np.float64)
             daily_rv = _rolling_realized_vol(close)
             symbol_daily_rv[sid] = daily_rv
 
@@ -68,11 +71,15 @@ class VolatilityStats:
                 if ord_key is not None:
                     cross_lists[int(ord_key)].append(float(rv_val))
 
-        cross_section = {
+        cross_section_raw = {
             k: (float(np.mean(v)), float(np.std(v)) + 1e-8)
             for k, v in cross_lists.items()
             if v
         }
+        # 截面 RV 统计 lag1：锚点日 o 使用 o-1 日已知的市场分布
+        cross_section: dict[int, tuple[float, float]] = {}
+        for o, stats in cross_section_raw.items():
+            cross_section[int(o) + 1] = stats
 
         own_percentile: dict[tuple[int, int], float] = {}
         anchor_rv: dict[tuple[int, int], float] = {}
@@ -130,7 +137,7 @@ class VolatilityStats:
                     p90,
                 )
         logger.info(
-            "VolatilityStats: %d symbols, %d cross-section dates, %d own-percentile keys",
+            "VolatilityStats: %d symbols, %d cross-section dates (lag1), %d own-percentile keys",
             len(symbol_daily_rv),
             len(cross_section),
             len(own_percentile),
@@ -219,6 +226,41 @@ class VolatilityStats:
 
             out[i, 2] = float(rv / self.global_baseline - 1.0)
 
+        return out
+
+    def lookup_at_anchor_numpy(
+        self,
+        stock_ids: np.ndarray,
+        timestamps: np.ndarray,
+    ) -> np.ndarray:
+        """NumPy 版 vol_context [B, 3]（物化专用）。"""
+        b = int(stock_ids.shape[0])
+        out = np.zeros((b, 3), dtype=np.float32)
+        out[:, 0] = 0.5
+        for i in range(b):
+            sid = int(stock_ids[i])
+            ord_key = int(timestamps[i])
+            key = (sid, ord_key)
+            rv = self.anchor_rv.get(key)
+            if rv is None:
+                series = self.symbol_daily_rv.get(sid)
+                if series is not None and len(series):
+                    valid = series[~np.isnan(series)]
+                    rv = float(valid[-1]) if valid.size else self.global_baseline
+                else:
+                    rv = self.global_baseline
+            rv = float(rv)
+
+            pct = self.own_percentile.get(key)
+            if pct is not None:
+                out[i, 0] = pct
+
+            cs = self.cross_section.get(ord_key)
+            if cs is not None:
+                cs_mean, cs_std = cs
+                out[i, 1] = (rv - cs_mean) / cs_std
+
+            out[i, 2] = float(rv / self.global_baseline - 1.0)
         return out
 
     def lookup_from_ohlcv_batch(

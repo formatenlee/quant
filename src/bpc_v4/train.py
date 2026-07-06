@@ -43,17 +43,31 @@ except ImportError:
         return GradScaler(enabled=enabled)
 
 from quant_cursor.bpc.dataset import load_qlib_instruments
+from quant_cursor.bpc.metrics import MetricsLogger
 from quant_cursor.config import load_config
 
 from .config import GlobalConfig
+from .cpu_parallel import raise_nofile_soft_limit
 from .dataset import (
     LoaderOptions,
     create_dataloaders,
     iter_training_batches,
+    materialize_datasets,
+    resolve_training_datasets,
     to_device,
     _loader_has_gpu_batches,
 )
+from .diagnostics_v4 import audit_purity_targets, audit_s1_token_diversity, compute_zq_bpc_correlation
 from .kronos import sync_kronos_config
+from .kronos_cache import resolve_kronos_cache_dir
+from .loss_plots import LossCurveTrackerV4
+from .metrics_v4 import (
+    accumulate_tensor_metrics,
+    finalize_averaged_metrics,
+    format_epoch_summary,
+    format_metrics_lines,
+)
+from .monitoring_v4 import accumulate_monitoring, compute_step_monitoring, finalize_monitoring
 from .model import BPCV4Model
 
 logger = logging.getLogger("quant_cursor.bpc_v4.train")
@@ -71,6 +85,58 @@ _V4_VALUE_DEFAULTS: dict[str, str] = {
 }
 
 
+def _log_epoch_metrics(
+    epoch: int,
+    lr: float,
+    train_metrics: dict,
+    val_metrics: dict | None = None,
+    *,
+    extra: str = "",
+    total_epochs: int | None = None,
+) -> None:
+    """v3 风格分组日志：摘要行 + 分项纯度 / 方向预测。"""
+    ep_label = f"{epoch}/{total_epochs}" if total_epochs else str(epoch)
+    suffix = f" | {extra}" if extra else ""
+    logger.info("Epoch %s | lr=%.2e%s", ep_label, lr, suffix)
+    summary = format_epoch_summary(train_metrics, val_metrics)
+    if "loss=" in summary:
+        logger.info(summary)
+    for line in format_metrics_lines(train_metrics, indent="  [train] "):
+        logger.info(line)
+    if val_metrics:
+        for line in format_metrics_lines(val_metrics, indent="  [val]   "):
+            logger.info(line)
+
+
+def _metrics_to_record(prefix: str, metrics: dict) -> dict[str, float]:
+    """将 epoch 指标写入 metrics.jsonl / loss_plots 的 train_/val_ 列。"""
+    out: dict[str, float] = {}
+    for key, value in metrics.items():
+        if key == "weighted_purity":
+            continue
+        if isinstance(value, (int, float)):
+            out[f"{prefix}_{key}"] = float(value)
+    if f"{prefix}_loss_purity_total" not in out and f"{prefix}_purity_loss" in out:
+        out[f"{prefix}_loss_purity_total"] = out[f"{prefix}_purity_loss"]
+    return out
+
+
+def _audit_training_batch(train_ds, model_cfg) -> None:
+    """启动前检查数据与标签分布，便于发现平凡解/缺字段。"""
+    if len(train_ds) == 0:
+        return
+    sample = train_ds[0]
+    has_purity = "purity_target" in sample
+    if not has_purity:
+        logger.warning("训练集缺少 purity_target，纯度 loss 将退化为均匀占位标签")
+    audit_s1_token_diversity(
+        train_ds,
+        vocab_size=model_cfg.head.codebook_output_dim,
+        n_sample=min(5000, len(train_ds)),
+        fail_if_degenerate=True,
+    )
+
+
 def train_epoch(
     model,
     loader,
@@ -81,12 +147,19 @@ def train_epoch(
     max_grad_norm: float = 1.0,
     non_blocking: bool = False,
     skip_device_transfer: bool = False,
+    show_progress: bool = False,
 ):
     model.train()
-    total_loss = total_purity = total_codebook = steps = 0
+    total: dict[str, float] = {}
+    monitor_total: dict[str, float] = {}
+    steps = 0
     gpu_batches = skip_device_transfer or _loader_has_gpu_batches(loader)
 
-    for batch in tqdm(iter_training_batches(loader), desc="Training"):
+    batch_iter = iter_training_batches(loader)
+    if show_progress:
+        batch_iter = tqdm(batch_iter, desc="Training", leave=False)
+
+    for batch in batch_iter:
         if not gpu_batches:
             batch = to_device(batch, device, non_blocking=non_blocking)
         optimizer.zero_grad()
@@ -99,31 +172,34 @@ def train_epoch(
 
         if not torch.isfinite(loss):
             logger.error(
-                "Non-finite loss at step %d: loss=%s purity=%s codebook=%s",
+                "Non-finite loss at step %d: loss=%s purity=%s",
                 steps + 1,
                 loss.item(),
                 losses["purity_loss"].item(),
-                losses["codebook_loss"].item(),
             )
             raise RuntimeError(
-                "训练 loss 非有限值 (NaN/Inf)。常见原因：s1_ids 超出 codebook 类别、"
-                "输入含 NaN、或 AMP 溢出。请更新代码后 --force-rebuild-preprocessed 重试。"
+                "训练 loss 非有限值 (NaN/Inf)。常见原因：输入含 NaN 或 AMP 溢出。"
+                "请 --force-rebuild-preprocessed 重试。"
             )
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
         scaler.step(optimizer)
         scaler.update()
 
-        total_loss += loss.item()
-        total_purity += losses["purity_loss"].item()
-        total_codebook += losses["codebook_loss"].item()
+        accumulate_tensor_metrics(total, losses)
+        accumulate_monitoring(monitor_total, compute_step_monitoring(batch, outputs))
+        total["grad_norm"] = total.get("grad_norm", 0.0) + float(grad_norm.detach().item())
         steps += 1
 
     if steps == 0:
         raise RuntimeError("训练集 0 batch，请检查 batch_size / max_samples / 数据范围")
-    return {"loss": total_loss / steps, "purity_loss": total_purity / steps, "codebook_loss": total_codebook / steps}
+
+    metrics = finalize_averaged_metrics(total, steps)
+    metrics.update(finalize_monitoring(monitor_total, steps))
+    metrics["weighted_purity"] = model.purity_weight * metrics.get("purity_loss", 0.0)
+    return metrics
 
 
 @torch.no_grad()
@@ -135,12 +211,21 @@ def eval_epoch(
     non_blocking: bool = False,
     skip_device_transfer: bool = False,
     max_batches: int = 0,
+    compute_interpretability: bool = False,
+    show_progress: bool = False,
 ):
     model.eval()
-    total_loss = total_purity = total_codebook = total_acc = steps = 0
+    total: dict[str, float] = {}
+    monitor_total: dict[str, float] = {}
+    steps = 0
+    zq_bpc_corr: float | None = None
     gpu_batches = skip_device_transfer or _loader_has_gpu_batches(loader)
 
-    for batch in tqdm(iter_training_batches(loader), desc="Evaluating"):
+    batch_iter = iter_training_batches(loader)
+    if show_progress:
+        batch_iter = tqdm(batch_iter, desc="Evaluating", leave=False)
+
+    for batch in batch_iter:
         if max_batches > 0 and steps >= max_batches:
             break
         if not gpu_batches:
@@ -148,23 +233,27 @@ def eval_epoch(
         outputs = model(batch)
         losses = model.compute_loss(batch, outputs)
 
-        total_loss += losses["loss"].item()
-        total_purity += losses["purity_loss"].item()
-        total_codebook += losses["codebook_loss"].item()
-
-        pred = outputs["codebook_logits"].argmax(dim=-1)
-        target = model._codebook_targets(batch["s1_ids"])
-        total_acc += (pred == target).float().mean().item()
+        accumulate_tensor_metrics(total, losses)
+        accumulate_monitoring(monitor_total, compute_step_monitoring(batch, outputs))
         steps += 1
 
+        if compute_interpretability and zq_bpc_corr is None:
+            stats = compute_zq_bpc_correlation(batch["z_q"], batch["bpc_feat"])
+            zq_bpc_corr = stats["mean_abs_corr"]
+
     if steps == 0:
-        return {"loss": float("inf"), "purity_loss": 0.0, "codebook_loss": 0.0, "codebook_acc": 0.0}
-    return {
-        "loss": total_loss / steps,
-        "purity_loss": total_purity / steps,
-        "codebook_loss": total_codebook / steps,
-        "codebook_acc": total_acc / steps,
-    }
+        return {
+            "loss": float("inf"),
+            "purity_loss": 0.0,
+            "zq_bpc_corr_mean": None,
+        }
+
+    metrics = finalize_averaged_metrics(total, steps)
+    metrics.update(finalize_monitoring(monitor_total, steps))
+    metrics["weighted_purity"] = model.purity_weight * metrics.get("purity_loss", 0.0)
+    if zq_bpc_corr is not None:
+        metrics["zq_bpc_corr_mean"] = zq_bpc_corr
+    return metrics
 
 
 def run_training(
@@ -174,12 +263,18 @@ def run_training(
     resume: str | None = None,
     preprocessed_dir: Path | None = None,
     save_preprocessed: Path | None = None,
-    force_rebuild_preprocessed: bool = False,
     max_samples_per_instrument: int | None = None,
     val_every: int = 1,
+    log_every: int = 1,
     save_every: int = 10,
     val_max_batches: int = 0,
     preprocess_only: bool = False,
+    kronos_cache_dir: Path | None = None,
+    allow_live_kronos: bool = False,
+    cpu_threads: int = 4,
+    show_progress: bool = False,
+    materialize_fork: bool = False,
+    force_rebuild_preprocessed: bool = False,
 ) -> None:
     device = torch.device(config.train.device if torch.cuda.is_available() else "cpu")
     use_cuda = device.type == "cuda"
@@ -187,20 +282,66 @@ def run_training(
 
     sync_kronos_config(config)
 
-    train_loader, val_loader, _ = create_dataloaders(
-        config,
-        loader_opts,
-        preprocessed_dir=preprocessed_dir,
-        save_preprocessed=save_preprocessed,
-        force_rebuild_preprocessed=force_rebuild_preprocessed,
-        max_samples_per_instrument=max_samples_per_instrument,
-    )
-
     if preprocess_only:
-        logger.info("preprocess-only: 数据物化完成，跳过训练")
+        if save_preprocessed is None:
+            raise RuntimeError(
+                "预处理物化须指定 --save-preprocessed <dir>，供后续训练 --preprocessed-dir 加载。"
+            )
+        materialize_datasets(
+            config,
+            max_samples_per_instrument=max_samples_per_instrument,
+            save_preprocessed=save_preprocessed,
+            seed=loader_opts.seed,
+            kronos_cache_dir=kronos_cache_dir,
+            allow_live_kronos=allow_live_kronos,
+            cpu_threads=cpu_threads,
+            materialize_fork=materialize_fork,
+        )
+        logger.info("preprocess-only: 物化完成，已保存至 %s。训练请: --preprocessed-dir %s", save_preprocessed, save_preprocessed)
         return
 
+    share_memory = (
+        loader_opts.num_workers > 0
+        and not loader_opts.gpu_cache_data
+        and not loader_opts.batched_gpu
+    )
+    train_ds, val_ds, _test_ds = resolve_training_datasets(
+        config,
+        preprocessed_dir=preprocessed_dir,
+        save_preprocessed=save_preprocessed,
+        force_rebuild=force_rebuild_preprocessed,
+        share_memory=share_memory,
+        max_samples_per_instrument=max_samples_per_instrument,
+        seed=loader_opts.seed,
+        kronos_cache_dir=kronos_cache_dir,
+        allow_live_kronos=allow_live_kronos,
+        cpu_threads=cpu_threads,
+        materialize_fork=materialize_fork,
+    )
+    train_loader, val_loader, train_ds, _val_ds = create_dataloaders(
+        config,
+        loader_opts,
+        train_ds,
+        val_ds,
+    )
+
     batched_gpu_resident = loader_opts.batched_gpu and use_cuda and not loader_opts.batched_gpu_cpu
+    if batched_gpu_resident:
+        logger.info("Training mode: GPU-resident — iter_batches() only slices preloaded tensors")
+    elif loader_opts.gpu_cache_data:
+        logger.info("Training mode: GpuCached — single-sample index on GPU (consider --batched-gpu)")
+    else:
+        logger.warning(
+            "Training mode: DataLoader H2D each batch. With ample RAM use --batched-gpu to "
+            "preload all features to GPU before epoch 1."
+        )
+
+    audit_purity_targets(train_ds)
+    _audit_training_batch(train_ds, config)
+
+    metrics_logger = MetricsLogger(config.train.save_dir)
+    loss_tracker = LossCurveTrackerV4(config.train.save_dir)
+
     pin_memory = use_cuda and not batched_gpu_resident and not loader_opts.gpu_cache_data
     non_blocking = pin_memory and not batched_gpu_resident
 
@@ -218,31 +359,33 @@ def run_training(
         logger.info("Resumed from %s at epoch %d", resume, start_epoch)
 
     best_val_loss = float("inf")
+    log_every = max(1, int(log_every))
     for epoch in range(start_epoch, config.train.epochs):
-        logger.info("\n%s\nEpoch %d/%d", "=" * 50, epoch + 1, config.train.epochs)
+        should_log = (
+            (epoch + 1) % log_every == 0
+            or epoch == start_epoch
+            or epoch + 1 == config.train.epochs
+        )
+        if should_log:
+            logger.info("%s", "=" * 50)
 
         train_metrics = train_epoch(
             model, train_loader, optimizer, scaler, device,
             max_grad_norm=config.train.max_grad_norm,
             non_blocking=non_blocking,
             skip_device_transfer=batched_gpu_resident or loader_opts.gpu_cache_data,
-        )
-        logger.info(
-            "Train: loss=%.4f, purity=%.4f, cb=%.4f",
-            train_metrics["loss"], train_metrics["purity_loss"], train_metrics["codebook_loss"],
+            show_progress=show_progress,
         )
 
+        val_metrics = None
         if (epoch + 1) % val_every == 0 or epoch + 1 == config.train.epochs:
             val_metrics = eval_epoch(
                 model, val_loader, device,
                 non_blocking=non_blocking,
                 skip_device_transfer=batched_gpu_resident or loader_opts.gpu_cache_data,
                 max_batches=val_max_batches,
-            )
-            logger.info(
-                "Val: loss=%.4f, purity=%.4f, cb=%.4f, acc=%.4f",
-                val_metrics["loss"], val_metrics["purity_loss"],
-                val_metrics["codebook_loss"], val_metrics["codebook_acc"],
+                compute_interpretability=((epoch + 1) % 5 == 0 or epoch + 1 == config.train.epochs),
+                show_progress=show_progress,
             )
             if val_metrics["loss"] < best_val_loss:
                 best_val_loss = val_metrics["loss"]
@@ -252,6 +395,36 @@ def run_training(
                 )
                 logger.info("Best model saved (val_loss=%.4f)", best_val_loss)
 
+        extra = ""
+        if val_metrics and val_metrics.get("zq_bpc_corr_mean") is not None:
+            extra = f"zq_bpc_corr={val_metrics['zq_bpc_corr_mean']:.4f}"
+        if should_log:
+            _log_epoch_metrics(
+                epoch + 1,
+                scheduler.get_last_lr()[0],
+                train_metrics,
+                val_metrics,
+                extra=extra,
+                total_epochs=config.train.epochs,
+            )
+
+        record = {
+            "phase": "epoch",
+            "epoch": epoch + 1,
+            "lr": scheduler.get_last_lr()[0],
+        }
+        record.update(_metrics_to_record("train", train_metrics))
+        if val_metrics is not None:
+            record.update(_metrics_to_record("val", val_metrics))
+            if val_metrics.get("zq_bpc_corr_mean") is not None:
+                record["zq_bpc_corr_mean"] = val_metrics["zq_bpc_corr_mean"]
+        metrics_logger.log(record)
+        loss_tracker.update_from_record(record)
+
+        # 每 5 个 epoch 或最后一个 epoch 渲染一次
+        if (epoch + 1) % 5 == 0 or epoch + 1 == config.train.epochs:
+            loss_tracker.render()
+
         scheduler.step()
 
         if save_every > 0 and (epoch + 1) % save_every == 0:
@@ -260,6 +433,9 @@ def run_training(
                 config.train.save_dir / f"checkpoint_epoch_{epoch+1}.pt",
             )
 
+    # 最终渲染
+    loss_tracker.render()
+    metrics_logger.close()
     logger.info("Training complete!")
 
 
@@ -356,6 +532,12 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, bool]
     p.add_argument("--resume", type=str, default=None)
     p.add_argument("--output-dir", type=str, default=None)
     p.add_argument("--val-every", type=int, default=5)
+    p.add_argument(
+        "--log-every",
+        type=int,
+        default=1,
+        help="每 N epoch 向控制台打印一次 train/val 指标摘要（metrics.jsonl 仍每 epoch 记录）",
+    )
     p.add_argument("--save-every", type=int, default=10)
     p.add_argument("--val-max-batches", type=int, default=0)
     p.add_argument("--num-workers", type=int, default=8)
@@ -364,11 +546,34 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, bool]
     p.add_argument("--batched-gpu", action="store_true")
     p.add_argument("--batched-gpu-cpu", action="store_true")
     p.add_argument("--batched-gpu-resident", action="store_true")
-    p.add_argument("--preprocessed-dir", type=str, default=None)
-    p.add_argument("--save-preprocessed", type=str, default=None)
-    p.add_argument("--force-rebuild-preprocessed", action="store_true")
+    p.add_argument(
+        "--preprocessed-dir",
+        type=str,
+        default=None,
+        help="可选：已物化 train/val 目录；省略则在训练启动前现场物化（需 --kronos-cache-dir）",
+    )
+    p.add_argument(
+        "--save-preprocessed",
+        type=str,
+        default=None,
+        help="预处理用：物化完成后保存到此目录（须与 --preprocess-only 同用）",
+    )
+    p.add_argument("--force-rebuild-preprocessed", action="store_true", help="忽略 --preprocessed-dir，强制重新物化")
     p.add_argument("--preprocess-only", action="store_true")
     p.add_argument("--kronos-path", type=str, default=None)
+    p.add_argument("--kronos-cache-dir", type=str, default=None, help="Kronos 预计算缓存目录")
+    p.add_argument("--allow-live-kronos", action="store_true", help="无缓存时在线编码（慢，调试用）")
+    p.add_argument("--cpu-threads", type=int, default=4, help="物化/Kronos 预计算 CPU 线程数（默认 4）")
+    p.add_argument(
+        "--materialize-fork",
+        action="store_true",
+        help="Linux：物化用 fork 进程池绕过 GIL（需足够 fd；失败则改线程池）",
+    )
+    p.add_argument(
+        "--show-progress",
+        action="store_true",
+        help="显示 tqdm 训练/验证进度条（默认关闭，减少控制台噪音）",
+    )
     return p.parse_args(injected), small_data
 
 
@@ -380,6 +585,7 @@ def _resolve_sample_cap(args: argparse.Namespace) -> int | None:
 
 
 def main() -> int:
+    raise_nofile_soft_limit()
     logger.info("BPC-v4 entry: %s", Path(__file__).resolve())
     args, small_data = parse_args()
     _apply_dev_preset(args)
@@ -391,6 +597,14 @@ def main() -> int:
         args.batched_gpu = True
     if args.batched_gpu_cpu and not args.batched_gpu:
         args.batched_gpu = True
+
+    use_cuda_requested = args.device == "cuda" and torch.cuda.is_available()
+    if use_cuda_requested and not args.batched_gpu and not args.gpu_cache_data:
+        args.batched_gpu = True
+        logger.info(
+            "CUDA: auto-enabled --batched-gpu — all samples upload to GPU once before training "
+            "(zero H2D / zero Kronos-BPC recompute per step)"
+        )
 
     qc_cfg = load_config(Path(args.config) if args.config else None)
     start = args.start or "2019-01-01"
@@ -426,12 +640,14 @@ def main() -> int:
     config.train.device = args.device
     config.train.save_dir = out_dir
     config.train.amp = args.amp
+    config.train.log_every = args.log_every
     config.qlib.provider_uri = qc_cfg.qlib_data_dir
     config.qlib.start_date = start
     config.qlib.end_date = end
     config.qlib.instruments = instruments
     config.qlib.max_samples = args.max_samples
     config.qlib.val_ratio = args.val_ratio
+    config.preprocess.cpu_threads = args.cpu_threads
     if args.kronos_path:
         config.kronos.local_path = args.kronos_path
     else:
@@ -468,15 +684,28 @@ def main() -> int:
         seed=args.seed,
     )
 
+    kronos_cache_dir = resolve_kronos_cache_dir(
+        explicit=Path(args.kronos_cache_dir) if args.kronos_cache_dir else None,
+        default_dir=qc_cfg.data_dir / "kronos_cache",
+        config=config,
+        allow_live_kronos=args.allow_live_kronos,
+    )
+
+    kc_log = str(kronos_cache_dir) if kronos_cache_dir else ("live" if args.allow_live_kronos else "MISSING")
     logger.info(
-        "BPC-v4: instruments=%d window=%s..%s max_spi=%s qlib=%s output=%s",
+        "BPC-v4: instruments=%d window=%s..%s max_spi=%s qlib=%s output=%s kronos_cache=%s",
         len(instruments),
         start,
         end,
         max_spi if max_spi is not None else "all",
         config.qlib.provider_uri,
         out_dir,
+        kc_log,
     )
+
+    if args.preprocess_only:
+        if not args.save_preprocessed:
+            raise SystemExit("error: --preprocess-only 须配合 --save-preprocessed <dir>")
 
     run_training(
         config,
@@ -484,12 +713,18 @@ def main() -> int:
         resume=args.resume,
         preprocessed_dir=Path(args.preprocessed_dir) if args.preprocessed_dir else None,
         save_preprocessed=Path(args.save_preprocessed) if args.save_preprocessed else None,
-        force_rebuild_preprocessed=args.force_rebuild_preprocessed,
         max_samples_per_instrument=max_spi,
         val_every=args.val_every,
+        log_every=args.log_every,
         save_every=args.save_every,
         val_max_batches=args.val_max_batches,
         preprocess_only=args.preprocess_only,
+        kronos_cache_dir=kronos_cache_dir,
+        allow_live_kronos=args.allow_live_kronos,
+        cpu_threads=args.cpu_threads,
+        show_progress=args.show_progress,
+        materialize_fork=args.materialize_fork,
+        force_rebuild_preprocessed=args.force_rebuild_preprocessed,
     )
     return 0
 
