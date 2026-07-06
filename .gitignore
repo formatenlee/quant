@@ -1,4 +1,18 @@
-
-__pycache__
 .venv/
-data/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+data/indices/
+data/etf/
+data/meta/universe.parquet
+*.log
+.DS_Store
+
+# 远程部署凭据（勿提交）
+scripts/remote_bpc_v3.env
+scripts/*.remote.env
+/data
